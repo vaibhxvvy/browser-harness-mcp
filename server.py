@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import time
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -30,6 +31,11 @@ for _stream in (sys.stdout, sys.stderr):
 
 from mcp.server import MCPServer
 from PIL import Image
+
+# We own the tab marker (🥸, applied by _mark_disguise on tab-attaching tools).
+# The backend's horse marker stays off so the two never stack. The daemon
+# inherits this on fresh spawns; reload it once if an old daemon still marks.
+os.environ.setdefault("BH_TAB_MARKER", "0")
 
 try:
     from browser_harness.admin import ensure_daemon
@@ -49,6 +55,8 @@ try:
         page_info,
         press_key,
         scroll,
+        start_recording,
+        stop_recording,
         switch_tab,
         type_text,
         upload_file,
@@ -124,6 +132,39 @@ def _poll_js_text(expression: str, needle: str, timeout: float = 12.0):
     return False, last
 
 
+def _local_endpoint_alive(timeout: float = 1.5) -> bool:
+    """True if a local CDP endpoint answers. Fails fast so a dead browser
+    reports in ~1s instead of burning ensure_daemon's 30s timeout."""
+    if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS"):
+        return True  # remote endpoint: let ensure_daemon judge it
+    for port in (9222, 9223):
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=timeout
+            ) as response:
+                version = json.loads(response.read())
+            if isinstance(version, dict) and version.get("webSocketDebuggerUrl"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _mark_disguise():
+    """Prepend 🥸 to the current tab title (backend marking stays off).
+
+    Also strips a legacy horse prefix once, so tabs marked by older daemons
+    migrate cleanly instead of stacking markers.
+    """
+    try:
+        cdp("Runtime.evaluate", expression=(
+            "if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3);"
+            "if(!document.title.startsWith('\U0001F978'))document.title='\U0001F978 '+document.title"
+        ))
+    except Exception:
+        pass
+
+
 @contextmanager
 def _stderr_stdout():
     """Keep MCP stdio clean: helpers may print, redirect stdout to stderr."""
@@ -135,18 +176,45 @@ def _stderr_stdout():
         sys.stdout = saved
 
 
+# Read-only tools: safe to retry once after a transient IPC blip.
+# Anything that clicks, types, fills, uploads, or sends is NOT here —
+# retrying those could double-apply a side effect.
+_READ_ONLY_TOOLS = frozenset({
+    "browser_page_info",
+    "browser_js",
+    "browser_cdp",
+    "browser_list_tabs",
+    "browser_current_tab",
+    "browser_wait_for_load",
+    "browser_wait_for_element",
+    "browser_wait_for_text",
+})
+
+_NO_BROWSER = (
+    "no browser with CDP on 127.0.0.1:9222/9223 — launch Brave/Chrome with "
+    "--remote-debugging-port=9222 and retry"
+)
+
+
 def _tool(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        try:
-            if _BACKEND_ERROR:
-                return _dump({"error": _BACKEND_ERROR})
-            ensure_daemon()
-            with _stderr_stdout():
-                result = fn(*args, **kwargs)
-            return _dump(result)
-        except Exception as exc:  # MCP tools must serialize browser failures
-            return _dump({"error": str(exc)})
+        if _BACKEND_ERROR:
+            return _dump({"error": _BACKEND_ERROR})
+        if not _local_endpoint_alive():
+            return _dump({"error": _NO_BROWSER})
+        attempts = 2 if fn.__name__ in _READ_ONLY_TOOLS else 1
+        for attempt in range(attempts):
+            try:
+                ensure_daemon()
+                with _stderr_stdout():
+                    result = fn(*args, **kwargs)
+                return _dump(result)
+            except Exception as exc:  # MCP tools must serialize browser failures
+                if attempt + 1 >= attempts:
+                    return _dump({"error": str(exc)})
+                wait(1.0)
+        return _dump({"error": "unreachable"})  # pragma: no cover
 
     return SERVER.tool(name=fn.__name__, description=fn.__doc__ or "")(wrapper)
 
@@ -157,7 +225,9 @@ def _tool(fn):
 @_tool
 def browser_new_tab(url: str = "about:blank"):
     """Open a new browser tab. Returns the new tab's targetId."""
-    return {"targetId": new_tab(url)}
+    target = new_tab(url)
+    _mark_disguise()
+    return {"targetId": target}
 
 
 @_tool
@@ -177,6 +247,36 @@ def browser_click(x: int, y: int, button: str = "left", clicks: int = 1):
     """Click at screen coordinates (x, y). `button` is left/right/middle."""
     click_at_xy(x, y, button=button, clicks=clicks)
     return {"ok": True}
+
+
+@_tool
+def browser_click_text(text: str):
+    """Click the first button or link whose visible label contains `text`.
+
+    No coordinates needed — resolves via the accessibility tree, with a
+    DOM-text fallback. Exact-action tools (browser_click) still exist for
+    pixel-precise cases.
+    """
+    for n in _ax_nodes():
+        name = (n.get("name") or {}).get("value", "") or ""
+        role = (n.get("role") or {}).get("value", "")
+        if role in ("button", "link") and text in name:
+            bid = n.get("backendDOMNodeId")
+            if not bid:
+                continue
+            try:
+                model = cdp("DOM.getBoxModel", backendNodeId=bid)
+            except Exception:
+                continue
+            q = model["model"]["content"]
+            x, y = int(sum(q[0::2]) / 4), int(sum(q[1::2]) / 4)
+            click_at_xy(x, y)
+            return {"ok": True, "x": x, "y": y, "matched": name[:100]}
+    res = js("(function(){var els=document.querySelectorAll("
+             "'button,a,[role=button]');for(var i=0;i<els.length;i++){"
+             "if((els[i].innerText||'').indexOf(" + json.dumps(text) + ")!==-1)"
+             "{els[i].click();return 'clicked';}}return 'not found';})()")
+    return {"ok": res == "clicked", "fallback": res}
 
 
 @_tool
@@ -208,9 +308,11 @@ def browser_scroll(x: int, y: int, dy: int = -300, dx: int = 0):
 
 
 @_tool
-def browser_screenshot(path: str | None = None, full: bool = False):
-    """Capture a PNG screenshot. If `path` is omitted, a temp file is used."""
-    path = capture_screenshot(path=path, full=full)
+def browser_screenshot(path: str | None = None, full: bool = False,
+                       max_dim: int | None = None):
+    """Capture a PNG screenshot. If `path` is omitted, a temp file is used.
+    Set `max_dim` to downscale results larger than that dimension."""
+    path = capture_screenshot(path=path, full=full, max_dim=max_dim)
     width, height = Image.open(path).size
     return {"path": path, "width": width, "height": height,
             "size_bytes": os.path.getsize(path)}
@@ -231,7 +333,9 @@ def browser_current_tab():
 @_tool
 def browser_switch_tab(target: str):
     """Switch to tab by targetId or URL substring. Returns the sessionId."""
-    return {"sessionId": switch_tab(target)}
+    session = switch_tab(target)
+    _mark_disguise()
+    return {"sessionId": session}
 
 
 @_tool
@@ -244,7 +348,9 @@ def browser_close_tab(target: str | None = None):
 @_tool
 def browser_ensure_real_tab():
     """Switch to a real (non-internal) tab if current one is chrome:// or stale."""
-    return ensure_real_tab()
+    result = ensure_real_tab()
+    _mark_disguise()
+    return result
 
 
 @_tool
@@ -274,9 +380,24 @@ def browser_wait_for_element(selector: str, timeout: float = 10.0):
 
 
 @_tool
+def browser_wait_for_text(text: str, timeout: float = 15.0):
+    """Wait until `text` appears in the current tab body. Returns match + snippet."""
+    found, body = _poll_js_text("document.body.innerText.slice(0, 8000)", text, timeout=timeout)
+    i = body.find(text)
+    return {"found": found, "snippet": body[max(0, i - 200):i + 500] if found else body[:500]}
+
+
+@_tool
 def browser_js(expression: str):
-    """Evaluate a JavaScript expression in the current tab."""
-    return js(expression)
+    """Evaluate a JavaScript expression in the current tab.
+
+    Bare arrow functions are auto-invoked, so both `document.title` and
+    `() => document.title` work.
+    """
+    expr = expression.strip()
+    if expr.startswith("() =>") or expr.startswith("async () =>"):
+        expr = "(" + expr + ")()"
+    return js(expr)
 
 
 @_tool
@@ -296,6 +417,18 @@ def browser_upload_file(selector: str, path: str):
 def browser_http_get(url: str, timeout: float = 20.0):
     """HTTP GET `url` without the browser. Returns the response body."""
     return {"text": http_get(url, timeout=timeout)}
+
+
+@_tool
+def browser_start_recording(name: str | None = None, title: str | None = None):
+    """Start recording actions to a local directory."""
+    return {"recording_dir": start_recording(name=name, title=title)}
+
+
+@_tool
+def browser_stop_recording():
+    """Stop the active recording and return its directory."""
+    return {"recording_dir": stop_recording()}
 
 
 # --- Gmail flow (ported from job/harness_*.py) ---
@@ -332,22 +465,24 @@ def _click_node_by_name(name: str) -> dict:
 
 @_tool
 def gmail_open_login():
-    """Open Gmail login in a new tab. User completes sign-in manually."""
-    new_tab("https://mail.google.com/")
+    """Open Gmail login in the current tab. User completes sign-in manually."""
+    goto_url("https://mail.google.com/")
     wait(4)
     try:
         wait_for_load()
     except Exception:
         pass
+    _mark_disguise()
     return page_info()
 
 
 @_tool
 def gmail_compose(compose_url: str):
-    """Open a Gmail compose URL (prefilled to/subject/body). Returns page info."""
-    new_tab(compose_url)
+    """Open a Gmail compose URL (prefilled to/subject/body) in the current tab."""
+    goto_url(compose_url)
     # Poll for the compose box instead of a fixed sleep — usually ready in 1-3s.
     wait_for_element("input[name=subjectbox]", timeout=15.0)
+    _mark_disguise()
     return page_info()
 
 
@@ -367,9 +502,29 @@ def gmail_attach(pdf_path: str):
     return {"attached": found, "file": name}
 
 
+def _compose_preview():
+    """Best-effort snapshot of the open compose draft. Never raises."""
+    def _get(expression):
+        try:
+            return js(expression) or ""
+        except Exception:
+            return ""
+    subject = _get("document.querySelector('input[name=subjectbox]') ? "
+                   "document.querySelector('input[name=subjectbox]').value : ''")
+    body = _get("(function(){var el=document.querySelector('div[role=textbox]');"
+                "return el?el.innerText.slice(0,300):'';})()")
+    return {"subject": subject[:200], "body": body[:300]}
+
+
 @_tool
-def gmail_click_send():
-    """Click Gmail's Send button. Returns click coords + sent confirmation."""
+def gmail_click_send(confirm: bool = False):
+    """Click Gmail's Send button. Returns click coords + sent confirmation.
+
+    Safety gate: without confirm=True this sends nothing and returns a
+    preview of the pending draft instead. Pass confirm=True to send.
+    """
+    if not confirm:
+        return {"sent": False, "needs_confirm": True, "preview": _compose_preview()}
     clicked = _click_node_by_name("Send")
     # Poll for the banner instead of one check after a fixed sleep.
     found, _ = _poll_js_text("document.body.innerText.slice(0, 5000)", "Message sent", timeout=12.0)
@@ -379,14 +534,15 @@ def gmail_click_send():
 
 @_tool
 def gmail_check_sent(recipient: str, subject: str = ""):
-    """Open Sent Mail and check recipient (and optional subject) appears."""
-    new_tab("https://mail.google.com/mail/u/0/#sent")
+    """Open Sent Mail in the current tab; check recipient (and subject)."""
+    goto_url("https://mail.google.com/mail/u/0/#sent")
     try:
         wait_for_load(timeout=15)
     except Exception:
         pass
     # Poll for the address instead of fixed sleeps — Sent indexes at its own pace.
     found, text = _poll_js_text("document.body.innerText.slice(0, 8000)", recipient, timeout=15.0)
+    _mark_disguise()
     return {
         "recipient_found": found,
         "subject_found": bool(subject) and subject in text,

@@ -11,7 +11,7 @@ Single file: `server.py`. Stdio transport.
 
 ```text
 browser-harness-mcp/
-  server.py        # the MCP server (27 tools)
+  server.py        # the MCP server (31 tools)
   pyproject.toml   # package + deps (backend included)
   README.md        # this file
   LICENSE        # MIT
@@ -62,7 +62,7 @@ Only ONE `mcpServers` entry — this server is the whole thing.
 
 ## Tools
 
-Core browser (22):
+Core browser (26):
 
 | Tool | What it does |
 |---|---|
@@ -70,11 +70,12 @@ Core browser (22):
 | `browser_goto` | Navigate current tab |
 | `browser_page_info` | url, title, viewport |
 | `browser_click` | Click at x, y |
+| `browser_click_text` | Click button/link by visible label (no coords) |
 | `browser_type` | Type into focused element |
 | `browser_fill` | Fill input by CSS selector |
 | `browser_press` | Press key (+ modifiers) |
 | `browser_scroll` | Wheel scroll at x, y |
-| `browser_screenshot` | PNG path + size |
+| `browser_screenshot` | PNG path + size (`max_dim` downscales) |
 | `browser_list_tabs` | List tabs |
 | `browser_current_tab` | Active tab info |
 | `browser_switch_tab` | Switch by id / URL substring |
@@ -83,20 +84,23 @@ Core browser (22):
 | `browser_wait` | Sleep seconds |
 | `browser_wait_for_load` | Wait for readyState complete |
 | `browser_wait_for_element` | Wait for CSS selector |
-| `browser_js` | Run JS, return value |
+| `browser_wait_for_text` | Wait for text in page body |
+| `browser_js` | Run JS, return value (arrows auto-invoked) |
 | `browser_cdp` | Raw CDP call |
 | `browser_upload_file` | Set file input |
 | `browser_http_get` | Browser-less GET |
+| `browser_start_recording` | Record actions to a directory |
+| `browser_stop_recording` | Stop recording, return directory |
 | `browser_doctor` | Health check (daemon + browser, replaces any doctor CLI) |
 
-Gmail flow (5):
+Gmail flow (5, all in the current tab):
 
 | Tool | What it does |
 |---|---|
 | `gmail_open_login` | Open Gmail login (user signs in once) |
 | `gmail_compose` | Open a prefilled compose URL |
 | `gmail_attach` | Attach a PDF, verify it stuck |
-| `gmail_click_send` | Click Send, confirm "Message sent" |
+| `gmail_click_send` | Preview draft, or send with `confirm=True` |
 | `gmail_check_sent` | Verify recipient/subject in Sent Mail |
 
 Every tool returns JSON text. Failures return `{"error": "..."}` — never raises.
@@ -107,7 +111,8 @@ Every tool returns JSON text. Failures return `{"error": "..."}` — never raise
 gmail_open_login → sign in once in the debug Chrome window
 gmail_compose(compose_url="https://mail.google.com/mail/?view=cm&to=someone@example.com")
 gmail_attach(pdf_path="/path/to/resume.pdf")
-gmail_click_send() → {"sent": true}
+gmail_click_send() → {"sent": false, "needs_confirm": true, "preview": {...}}
+gmail_click_send(confirm=True) → {"sent": true}
 gmail_check_sent(recipient="someone@example.com", subject="Application for Prompt Engineer")
 ```
 
@@ -123,6 +128,10 @@ browser_screenshot()
 ## Notes
 
 - Backend (`browser_harness` daemon) is a declared dependency — the ONE install command pulls it, no separate install.
+- Dead browser fails fast (~1s) instead of hanging 30s.
+- Read-only tools retry once on transient IPC blips; clicking/typing/sending never retry (no double side effects).
+- `gmail_click_send` sends nothing without `confirm=True` — first call returns a draft preview.
+- This package owns the tab marker (🥸, applied on tab-attach tools, legacy horse stripped once). Backend marking is disabled via `BH_TAB_MARKER=0`; reload an old daemon once to pick that up.
 - If the backend is ever missing, tools return `{"error": "...run ONE command..."}` instead of crashing.
 - stdout is redirected to stderr inside tools so MCP stdio never corrupts.
 - NaN/Infinity/bytes/dates are normalized before JSON serialization.
