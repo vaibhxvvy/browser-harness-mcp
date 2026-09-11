@@ -11,7 +11,7 @@ Single file: `server.py`. Stdio transport.
 
 ```text
 browser-harness-mcp/
-  server.py        # the MCP server (31 tools)
+  server.py        # the MCP server (32 tools)
   pyproject.toml   # package + deps (backend included)
   README.md        # this file
   LICENSE        # MIT
@@ -62,7 +62,7 @@ Only ONE `mcpServers` entry — this server is the whole thing.
 
 ## Tools
 
-Core browser (26):
+Core browser (27):
 
 | Tool | What it does |
 |---|---|
@@ -80,6 +80,7 @@ Core browser (26):
 | `browser_current_tab` | Active tab info |
 | `browser_switch_tab` | Switch by id / URL substring |
 | `browser_close_tab` | Close tab |
+| `browser_task_tabs` | EXPLICIT multi-tab entry (parallel tasks only) |
 | `browser_ensure_real_tab` | Escape chrome:// pages |
 | `browser_wait` | Sleep seconds |
 | `browser_wait_for_load` | Wait for readyState complete |
@@ -105,6 +106,19 @@ Gmail flow (5, all in the current tab):
 
 Every tool returns JSON text. Failures return `{"error": "..."}` — never raises.
 
+## Parallel tabs (explicit only)
+
+Default is ONE tab: single-tab tasks must never open extra tabs — navigate the current tab.
+
+Only when the request is genuinely multi-task ("do these things at the same time"):
+
+```text
+browser_task_tabs(urls=[...]) → [{index, targetId, url}]
+browser_switch_tab(target_A) → act on A → browser_switch_tab(target_B) → act on B
+```
+
+Every tool call runs atomically under a server-side lock, so switched work can't interleave mid-flight. Execution across tabs is sequential, not simultaneous — the backend holds a single session, and true concurrency would land actions in wrong tabs.
+
 ## Usage (Gmail end-to-end)
 
 ```text
@@ -129,6 +143,7 @@ browser_screenshot()
 
 - Backend (`browser_harness` daemon) is a declared dependency — the ONE install command pulls it, no separate install.
 - Dead browser fails fast (~1s) instead of hanging 30s.
+- Tool calls are lock-atomic: explicit multi-tab work can't interleave.
 - Read-only tools retry once on transient IPC blips; clicking/typing/sending never retry (no double side effects).
 - `gmail_click_send` sends nothing without `confirm=True` — first call returns a draft preview.
 - This package owns the tab marker (🥸, applied on tab-attach tools, legacy horse stripped once). Backend marking is disabled via `BH_TAB_MARKER=0`; reload an old daemon once to pick that up.

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -196,6 +197,12 @@ _NO_BROWSER = (
 )
 
 
+# One global lock: the backend holds a single current session, so two
+# interleaved tool calls could act on the wrong tab. Every tool runs
+# atomically under this lock — explicit multi-tab workflows stay deterministic.
+_LOCK = threading.Lock()
+
+
 def _tool(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -204,16 +211,17 @@ def _tool(fn):
         if not _local_endpoint_alive():
             return _dump({"error": _NO_BROWSER})
         attempts = 2 if fn.__name__ in _READ_ONLY_TOOLS else 1
-        for attempt in range(attempts):
-            try:
-                ensure_daemon()
-                with _stderr_stdout():
-                    result = fn(*args, **kwargs)
-                return _dump(result)
-            except Exception as exc:  # MCP tools must serialize browser failures
-                if attempt + 1 >= attempts:
-                    return _dump({"error": str(exc)})
-                wait(1.0)
+        with _LOCK:
+            for attempt in range(attempts):
+                try:
+                    ensure_daemon()
+                    with _stderr_stdout():
+                        result = fn(*args, **kwargs)
+                    return _dump(result)
+                except Exception as exc:  # MCP tools must serialize browser failures
+                    if attempt + 1 >= attempts:
+                        return _dump({"error": str(exc)})
+                    wait(1.0)
         return _dump({"error": "unreachable"})  # pragma: no cover
 
     return SERVER.tool(name=fn.__name__, description=fn.__doc__ or "")(wrapper)
@@ -343,6 +351,24 @@ def browser_close_tab(target: str | None = None):
     """Close a tab. Without `target`, closes the active tab."""
     close_tab(target)
     return {"ok": True}
+
+
+@_tool
+def browser_task_tabs(urls: list[str]):
+    """EXPLICIT multi-tab entry point. Open one tab per URL for genuinely
+    parallel tasks ("do these N things at the same time").
+
+    Rule: single-tab tasks must NOT use this — stay on the current tab.
+    Multi-tab drivers must switch explicitly (browser_switch_tab) before
+    every act; calls are lock-atomic so switched work can't interleave.
+    Returns [{index, targetId, url}] in input order.
+    """
+    tabs = []
+    for i, url in enumerate(urls):
+        target = new_tab(url)
+        tabs.append({"index": i, "targetId": target, "url": url})
+    _mark_disguise()
+    return tabs
 
 
 @_tool
