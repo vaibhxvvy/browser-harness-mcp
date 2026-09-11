@@ -13,11 +13,20 @@ import json
 import math
 import os
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+# Windows consoles default to cp1252, which cannot encode the emoji markers
+# the backend prepends to tab titles — force UTF-8 so printing tool results
+# never raises UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try: _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception: pass
 
 from mcp.server import MCPServer
 from PIL import Image
@@ -62,6 +71,10 @@ SERVER = MCPServer("browser-harness")
 
 
 def _normalize(value: Any) -> Any:
+    if isinstance(value, str):
+        # Marker swap: show 🥸 everywhere, even against an upstream backend
+        # that still prepends 🐴.
+        return value.replace("\U0001F434", "\U0001F978")
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         return None
     if isinstance(value, dict):
@@ -89,6 +102,26 @@ def _dump(value: Any) -> str:
     return json.dumps(
         _normalize(value), ensure_ascii=False, allow_nan=False, default=_json_default
     )
+
+
+def _poll_js_text(expression: str, needle: str, timeout: float = 12.0):
+    """Poll a JS text expression until `needle` appears. Returns (found, last_text).
+
+    Replaces fixed sleeps: returns the moment the condition holds instead of
+    always waiting out the full timeout. Transient JS failures are ignored so
+    one bad poll doesn't fail the whole wait.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            last = js(expression) or ""
+        except Exception:
+            pass
+        if needle in last:
+            return True, last
+        wait(0.5)
+    return False, last
 
 
 @contextmanager
@@ -273,21 +306,27 @@ def _ax_nodes():
 
 
 def _click_node_by_name(name: str) -> dict:
+    found = None
     for n in _ax_nodes():
         n_name = n.get("name", {}).get("value", "")
         role = n.get("role", {}).get("value", "")
-        if n_name == name and role == "button":
-            bid = n.get("backendDOMNodeId")
-            model = cdp("DOM.getBoxModel", backendNodeId=bid)
-            q = model["model"]["content"]
-            x, y = sum(q[0::2]) / 4, sum(q[1::2]) / 4
-            click_at_xy(int(x), int(y))
-            return {"ok": True, "x": int(x), "y": int(y)}
-    # JS fallback for Gmail's div[role=button] Send
-    res = js("() => { const b = Array.from(document.querySelectorAll"
-            "('div[role=button]')).find(e => e.textContent.trim() === '"
-            + name + "'); if (b) { b.click(); return 'clicked'; }"
-            " return 'not found'; }")
+        if role == "button" and name in n_name:
+            found = n
+            if "Ctrl-Enter" in n_name:
+                break
+    if found is not None:
+        bid = found.get("backendDOMNodeId")
+        model = cdp("DOM.getBoxModel", backendNodeId=bid)
+        q = model["model"]["content"]
+        x, y = sum(q[0::2]) / 4, sum(q[1::2]) / 4
+        click_at_xy(int(x), int(y))
+        return {"ok": True, "x": int(x), "y": int(y)}
+    # JS fallback for Gmail's div[role=button] Send. Must be an IIFE —
+    # the backend returns {} for a bare arrow function instead of invoking it.
+    res = js("(() => { const b = Array.from(document.querySelectorAll"
+             "('div[role=button]')).find(e => e.textContent.trim() === '"
+             + name + "'); if (b) { b.click(); return 'clicked'; }"
+             " return 'not found'; })()")
     return {"ok": res == "clicked", "fallback": res}
 
 
@@ -307,11 +346,8 @@ def gmail_open_login():
 def gmail_compose(compose_url: str):
     """Open a Gmail compose URL (prefilled to/subject/body). Returns page info."""
     new_tab(compose_url)
-    wait(6)
-    try:
-        wait_for_load()
-    except Exception:
-        pass
+    # Poll for the compose box instead of a fixed sleep — usually ready in 1-3s.
+    wait_for_element("input[name=subjectbox]", timeout=15.0)
     return page_info()
 
 
@@ -326,21 +362,18 @@ def gmail_attach(pdf_path: str):
             continue
     wait(3)
     name = Path(pdf_path).name
-    found = js("() => document.documentElement.innerHTML.includes("
-               + json.dumps(name) + " )")
-    return {"attached": bool(found), "file": name}
+    probe = "document.documentElement.innerHTML.includes(" + json.dumps(name) + ") ? 'YES' : 'NO'"
+    found, _ = _poll_js_text(probe, "YES", timeout=10.0)
+    return {"attached": found, "file": name}
 
 
 @_tool
 def gmail_click_send():
     """Click Gmail's Send button. Returns click coords + sent confirmation."""
     clicked = _click_node_by_name("Send")
-    wait(5)
-    try:
-        body = js("() => document.body.innerText.slice(0, 5000)") or ""
-    except Exception:
-        body = ""
-    clicked["sent"] = "Message sent" in body
+    # Poll for the banner instead of one check after a fixed sleep.
+    found, _ = _poll_js_text("document.body.innerText.slice(0, 5000)", "Message sent", timeout=12.0)
+    clicked["sent"] = found
     return clicked
 
 
@@ -348,18 +381,14 @@ def gmail_click_send():
 def gmail_check_sent(recipient: str, subject: str = ""):
     """Open Sent Mail and check recipient (and optional subject) appears."""
     new_tab("https://mail.google.com/mail/u/0/#sent")
-    wait(6)
     try:
-        wait_for_load()
+        wait_for_load(timeout=15)
     except Exception:
         pass
-    wait(4)
-    try:
-        text = js("() => document.body.innerText.slice(0, 8000)") or ""
-    except Exception:
-        text = ""
+    # Poll for the address instead of fixed sleeps — Sent indexes at its own pace.
+    found, text = _poll_js_text("document.body.innerText.slice(0, 8000)", recipient, timeout=15.0)
     return {
-        "recipient_found": recipient in text,
+        "recipient_found": found,
         "subject_found": bool(subject) and subject in text,
         "snippet": text[:1000],
     }
