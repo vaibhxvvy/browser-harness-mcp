@@ -1,13 +1,15 @@
 """Browser Harness MCP — one MCP server for your real browser.
 
 Thin wrapper over the `browser_harness` daemon (CDP). Exposes core
-browser tools plus a Gmail send flow (open login → compose → attach → send).
+browser tools, page snapshots, cross-session memory, supervised
+multi-step plans, vision Q&A, and a Gmail send flow.
 
 Run:
     python server.py            # stdio MCP server named "browser-harness"
 """
 from __future__ import annotations
 
+import base64
 import functools
 import json
 import math
@@ -257,14 +259,9 @@ def browser_click(x: int, y: int, button: str = "left", clicks: int = 1):
     return {"ok": True}
 
 
-@_tool
-def browser_click_text(text: str):
-    """Click the first button or link whose visible label contains `text`.
-
-    No coordinates needed — resolves via the accessibility tree, with a
-    DOM-text fallback. Exact-action tools (browser_click) still exist for
-    pixel-precise cases.
-    """
+def _click_text_impl(text: str) -> dict:
+    """Click the first button/link whose label contains `text`. Raw helper —
+    shared by the tool and the plan runner (which must not re-enter the lock)."""
     for n in _ax_nodes():
         name = (n.get("name") or {}).get("value", "") or ""
         role = (n.get("role") or {}).get("value", "")
@@ -285,6 +282,41 @@ def browser_click_text(text: str):
              "if((els[i].innerText||'').indexOf(" + json.dumps(text) + ")!==-1)"
              "{els[i].click();return 'clicked';}}return 'not found';})()")
     return {"ok": res == "clicked", "fallback": res}
+
+
+@_tool
+def browser_click_text(text: str):
+    """Click the first button or link whose visible label contains `text`.
+
+    No coordinates needed — resolves via the accessibility tree, with a
+    DOM-text fallback. Exact-action tools (browser_click) still exist for
+    pixel-precise cases.
+    """
+    return _click_text_impl(text)
+
+
+def _snapshot_impl(limit: int):
+    """Page interactives with viewport coords. Exactly one CDP roundtrip."""
+    found = js("(function(){var out=[];var els=document.querySelectorAll("
+        "'button,a,input,select,textarea,[role=button],[role=link],[role=textbox]');"
+        "for(var i=0;i<els.length;i++){var e=els[i];var r=e.getBoundingClientRect();"
+        "if(r.width<2||r.height<2)continue;"
+        "var l=(e.getAttribute('aria-label')||e.innerText||e.value||e.placeholder||e.name||'')"
+        ".replace(/\\s+/g,' ').trim().slice(0,80);"
+        "out.push({tag:e.tagName.toLowerCase(),role:e.getAttribute('role')||'',label:l,"
+        "x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});}"
+        "return out;})()")
+    return (found or [])[:max(1, limit)]
+
+
+@_tool
+def browser_snapshot(limit: int = 100):
+    """One-call page context: interactive elements with viewport coords.
+
+    Returns [{tag, role, label, x, y}]. Recon with this first instead of
+    N probes; feed x/y straight into browser_click.
+    """
+    return _snapshot_impl(limit)
 
 
 @_tool
@@ -455,6 +487,196 @@ def browser_start_recording(name: str | None = None, title: str | None = None):
 def browser_stop_recording():
     """Stop the active recording and return its directory."""
     return {"recording_dir": stop_recording()}
+
+
+_MEMORY_FILE = Path.home() / ".browser-harness-mcp" / "memory.jsonl"
+
+
+def _read_memory(limit: int = 200):
+    try:
+        lines = _MEMORY_FILE.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def _save_note(site: str, fact: str):
+    _MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with _MEMORY_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": time.time(), "site": site, "fact": fact},
+                                ensure_ascii=False) + "\n")
+
+
+@_tool
+def browser_note(site: str, fact: str):
+    """Save a fact about a site/task for future sessions.
+
+    The harness never learns across restarts on its own — write down what
+    worked ("gmail Send button AX name contains Ctrl-Enter") and recall it
+    next time via browser_recall. This file is the self-improvement loop.
+    """
+    _save_note(site, fact)
+    return {"ok": True}
+
+
+@_tool
+def browser_recall(site: str = ""):
+    """Recall saved facts. Substring-matches `site`; empty returns recent."""
+    query = site.strip().lower()
+    mem = _read_memory()
+    if query:
+        mem = [m for m in mem if query in str(m.get("site", "")).lower()]
+    return mem[-50:]
+
+
+_BODY_SLICE = "document.body.innerText.slice(0, 8000)"
+
+_PLAN_ACTIONS = frozenset({
+    "goto", "js", "click_text", "fill", "press",
+    "wait_for_text", "wait_for_element", "wait", "snapshot", "note",
+})
+_PLAN_WRITES = frozenset({"click_text", "fill", "press"})
+
+
+def _validate_plan(steps, confirm_writes, max_steps):
+    """Pure plan check. Returns (ok, error, plan). Never touches the browser."""
+    if not isinstance(steps, list) or not steps:
+        return False, "steps must be a non-empty list", []
+    plan = steps[:max(1, int(max_steps))]
+    warning = "truncated to max_steps" if len(steps) > len(plan) else ""
+    for i, step in enumerate(plan):
+        if not isinstance(step, dict):
+            return False, f"step {i} must be an object", []
+        action = step.get("action", "")
+        if action not in _PLAN_ACTIONS:
+            return False, f"step {i}: unknown action {action!r}", []
+        if action in _PLAN_WRITES and not confirm_writes:
+            return False, f"step {i} ({action}) writes: pass confirm_writes=True", []
+        if not isinstance(step.get("args", {}), dict):
+            return False, f"step {i}: args must be an object", []
+    return True, warning, plan
+
+
+def _run_plan_step(action, args):
+    """Run one plan step with raw helpers (never wrapped tools: no lock nesting)."""
+    if action == "goto":
+        goto_url(args.get("url", "about:blank"))
+        return True, "navigated"
+    if action == "js":
+        return True, str(js(args.get("expression", "document.title")))[:300]
+    if action == "click_text":
+        result = _click_text_impl(args.get("text", ""))
+        return bool(result.get("ok")), str(result)[:300]
+    if action == "fill":
+        fill_input(args.get("selector", ""), args.get("text", ""),
+                   clear_first=bool(args.get("clear_first", True)))
+        return True, "filled"
+    if action == "press":
+        press_key(args.get("key", "Enter"), modifiers=int(args.get("modifiers", 0)))
+        return True, "pressed"
+    if action == "wait_for_text":
+        found, body = _poll_js_text(_BODY_SLICE, args.get("text", ""),
+                                    timeout=float(args.get("timeout", 10.0)))
+        return found, ("matched" if found else "timeout: " + body[:200])
+    if action == "wait_for_element":
+        ok = wait_for_element(args.get("selector", ""),
+                              timeout=float(args.get("timeout", 10.0)))
+        return ok, "present" if ok else "timeout"
+    if action == "wait":
+        wait(float(args.get("seconds", 1.0)))
+        return True, "waited"
+    if action == "snapshot":
+        return True, f"{len(_snapshot_impl(int(args.get('limit', 50))))} elements"
+    if action == "note":
+        _save_note(args.get("site", ""), args.get("fact", ""))
+        return True, "noted"
+    return False, "unreachable"
+
+
+@_tool
+def browser_achieve(goal: str, steps: list, confirm_writes: bool = False,
+                    max_steps: int = 20):
+    """Run a declared multi-step plan server-side, with verify + retry per step.
+
+    Planning stays with the calling agent — `steps` is explicit:
+    [{action, args?, expect?, expect_timeout?}]. Actions: goto, js,
+    click_text, fill, press, wait_for_text, wait_for_element, wait,
+    snapshot, note. Each step runs; `expect` text is verified and failed
+    steps retry once before the run aborts. Write actions
+    (click_text/fill/press) need confirm_writes=True.
+    Returns {goal, ok, transcript:[{step, action, ok, detail}]}.
+    """
+    ok, error, plan = _validate_plan(steps, confirm_writes, max_steps)
+    if not ok:
+        return {"goal": goal, "ok": False, "error": error, "transcript": []}
+    transcript = []
+    run_ok = True
+    for i, step in enumerate(plan):
+        action, args = step.get("action", ""), step.get("args", {}) or {}
+        expect = step.get("expect", "")
+        done, detail = False, ""
+        for _ in range(2):
+            done, detail = _run_plan_step(action, args)
+            if done and expect:
+                found, _ = _poll_js_text(_BODY_SLICE, expect,
+                                         timeout=float(step.get("expect_timeout", 8.0)))
+                done = found
+                detail = "verified" if found else f"expect missing: {expect[:100]}"
+            if done:
+                break
+            wait(1.0)
+        transcript.append({"step": i, "action": action, "ok": done,
+                           "detail": detail[:300]})
+        if not done:
+            run_ok = False
+            break
+    out = {"goal": goal, "ok": run_ok, "transcript": transcript}
+    if error:
+        out["warning"] = error
+    return out
+
+
+def _vision_ask(question: str, image_b64: str) -> str:
+    """Ask an OpenAI-compatible vision API about a PNG. Raises without a key."""
+    key = os.environ.get("BH_VISION_API_KEY", "")
+    if not key:
+        raise RuntimeError("no vision key: set BH_VISION_API_KEY "
+                           "(optional: BH_VISION_MODEL, BH_VISION_BASE_URL)")
+    model = os.environ.get("BH_VISION_MODEL", "gpt-4o-mini")
+    base = os.environ.get("BH_VISION_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 500,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}},
+        ]}],
+    }).encode()
+    request = urllib.request.Request(
+        base + "/chat/completions", data=payload,
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = json.loads(response.read())
+    return data["choices"][0]["message"]["content"]
+
+
+@_tool
+def browser_see(question: str):
+    """Ask a vision model about the current tab ("what does the blue button say?").
+
+    Screenshots the tab and sends it to an OpenAI-compatible chat API.
+    Needs BH_VISION_API_KEY in the environment (BH_VISION_MODEL defaults to
+    gpt-4o-mini, BH_VISION_BASE_URL to https://api.openai.com/v1).
+    """
+    shot = capture_screenshot(path=None, full=False, max_dim=1280)
+    answer = _vision_ask(question, base64.b64encode(Path(shot).read_bytes()).decode())
+    return {"answer": answer}
 
 
 # --- Gmail flow (ported from job/harness_*.py) ---

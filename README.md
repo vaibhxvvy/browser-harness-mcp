@@ -11,7 +11,8 @@ Single file: `server.py`. Stdio transport.
 
 ```text
 browser-harness-mcp/
-  server.py        # the MCP server (32 tools)
+  server.py        # the MCP server (37 tools)
+  SKILL.md         # agent workflow (single-tab default, memory, plans)
   pyproject.toml   # package + deps (backend included)
   README.md        # this file
   LICENSE        # MIT
@@ -62,13 +63,14 @@ Only ONE `mcpServers` entry — this server is the whole thing.
 
 ## Tools
 
-Core browser (27):
+Core browser (32):
 
 | Tool | What it does |
 |---|---|
 | `browser_new_tab` | Open tab, returns targetId |
 | `browser_goto` | Navigate current tab |
 | `browser_page_info` | url, title, viewport |
+| `browser_snapshot` | Labeled interactives + coords, one call |
 | `browser_click` | Click at x, y |
 | `browser_click_text` | Click button/link by visible label (no coords) |
 | `browser_type` | Type into focused element |
@@ -93,6 +95,9 @@ Core browser (27):
 | `browser_start_recording` | Record actions to a directory |
 | `browser_stop_recording` | Stop recording, return directory |
 | `browser_doctor` | Health check (daemon + browser, replaces any doctor CLI) |
+| `browser_note` / `browser_recall` | Cross-session memory (`~/.browser-harness-mcp/memory.jsonl`) |
+| `browser_achieve` | Supervised multi-step plans (verify + retry, write gate) |
+| `browser_see` | Vision Q&A on the current tab (needs `BH_VISION_API_KEY`) |
 
 Gmail flow (5, all in the current tab):
 
