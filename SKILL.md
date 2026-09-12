@@ -39,6 +39,7 @@ achieve supervises, it doesn't invent.
 
 ## Vision
 
-`browser_see(question)` answers visual questions ("what does the blue button
-say?"). Needs `BH_VISION_API_KEY` (plus optional `BH_VISION_MODEL` /
-`BH_VISION_BASE_URL`); without a key it errors — say so and continue blind.
+`browser_screenshot` returns the image itself — look at it, no key needed.
+`browser_see(question)` bundles screenshot + question the same way. Only
+text-only drivers need `BH_VISION_API_KEY` (plus optional `BH_VISION_MODEL` /
+`BH_VISION_BASE_URL`). Shots cost ~1–2k tokens; don't screenshot in a loop.

@@ -77,7 +77,7 @@ Core browser (32):
 | `browser_fill` | Fill input by CSS selector |
 | `browser_press` | Press key (+ modifiers) |
 | `browser_scroll` | Wheel scroll at x, y |
-| `browser_screenshot` | PNG path + size (`max_dim` downscales) |
+| `browser_screenshot` | PNG path + size AND the image itself (no key) |
 | `browser_list_tabs` | List tabs |
 | `browser_current_tab` | Active tab info |
 | `browser_switch_tab` | Switch by id / URL substring |
@@ -97,7 +97,7 @@ Core browser (32):
 | `browser_doctor` | Health check (daemon + browser, replaces any doctor CLI) |
 | `browser_note` / `browser_recall` | Cross-session memory (`~/.browser-harness-mcp/memory.jsonl`) |
 | `browser_achieve` | Supervised multi-step plans (verify + retry, write gate) |
-| `browser_see` | Vision Q&A on the current tab (needs `BH_VISION_API_KEY`) |
+| `browser_see` | Screenshot + question for the driving model (key only for text-only drivers) |
 
 Gmail flow (5, all in the current tab):
 
@@ -148,6 +148,9 @@ browser_screenshot()
 
 - Backend (`browser_harness` daemon) is a declared dependency — the ONE install command pulls it, no separate install.
 - Dead browser fails fast (~1s) instead of hanging 30s.
+- Vision is native: screenshot/see return image blocks the driving model
+  sees directly (~1–2k tokens a shot, capped at 1280px). `BH_VISION_API_KEY`
+  is only a fallback for text-only drivers.
 - Tool calls are lock-atomic: explicit multi-tab work can't interleave.
 - Read-only tools retry once on transient IPC blips; clicking/typing/sending never retry (no double side effects).
 - `gmail_click_send` sends nothing without `confirm=True` — first call returns a draft preview.

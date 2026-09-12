@@ -33,6 +33,7 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception: pass
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.utilities.types import Image as MCPImage
 from PIL import Image
 
 # We own the tab marker (🥸, applied by _mark_disguise on tab-attaching tools).
@@ -153,6 +154,17 @@ def _local_endpoint_alive(timeout: float = 1.5) -> bool:
     return False
 
 
+def _capped_copy(path: str, dim: int = 1280) -> str:
+    """Downscaled copy for the image block (token cost). Saved file untouched."""
+    img = Image.open(path)
+    if max(img.size) <= dim:
+        return path
+    img.thumbnail((dim, dim))
+    capped = str(Path(path).with_name(Path(path).stem + f"_capped{Path(path).suffix}"))
+    img.save(capped)
+    return capped
+
+
 def _mark_disguise():
     """Prepend 🥸 to the current tab title (backend marking stays off).
 
@@ -219,6 +231,10 @@ def _tool(fn):
                     ensure_daemon()
                     with _stderr_stdout():
                         result = fn(*args, **kwargs)
+                    # Native blocks (Image / lists with images) pass through so
+                    # the driving model sees them; everything else is JSON text.
+                    if isinstance(result, (MCPImage, list)):
+                        return result
                     return _dump(result)
                 except Exception as exc:  # MCP tools must serialize browser failures
                     if attempt + 1 >= attempts:
@@ -351,11 +367,17 @@ def browser_scroll(x: int, y: int, dy: int = -300, dx: int = 0):
 def browser_screenshot(path: str | None = None, full: bool = False,
                        max_dim: int | None = None):
     """Capture a PNG screenshot. If `path` is omitted, a temp file is used.
-    Set `max_dim` to downscale results larger than that dimension."""
+    Set `max_dim` to downscale results larger than that dimension.
+
+    Returns path/size info PLUS the image itself, so the driving model sees
+    the tab with no key. The image block is capped at 1280px (token cost);
+    the saved file keeps full resolution.
+    """
     path = capture_screenshot(path=path, full=full, max_dim=max_dim)
     width, height = Image.open(path).size
-    return {"path": path, "width": width, "height": height,
+    info = {"path": path, "width": width, "height": height,
             "size_bytes": os.path.getsize(path)}
+    return [_dump(info), MCPImage(path=_capped_copy(path))]
 
 
 @_tool
@@ -668,15 +690,19 @@ def _vision_ask(question: str, image_b64: str) -> str:
 
 @_tool
 def browser_see(question: str):
-    """Ask a vision model about the current tab ("what does the blue button say?").
+    """See the current tab, then answer `question` about it.
 
-    Screenshots the tab and sends it to an OpenAI-compatible chat API.
-    Needs BH_VISION_API_KEY in the environment (BH_VISION_MODEL defaults to
-    gpt-4o-mini, BH_VISION_BASE_URL to https://api.openai.com/v1).
+    Native-first: without a vision key this returns [screenshot, question]
+    so the DRIVING model answers directly — no key, no money, no extra hop.
+    Fallback for text-only drivers: set BH_VISION_API_KEY (optional
+    BH_VISION_MODEL / BH_VISION_BASE_URL) and this returns a text answer
+    from an OpenAI-compatible API instead.
     """
     shot = capture_screenshot(path=None, full=False, max_dim=1280)
-    answer = _vision_ask(question, base64.b64encode(Path(shot).read_bytes()).decode())
-    return {"answer": answer}
+    if os.environ.get("BH_VISION_API_KEY", ""):
+        answer = _vision_ask(question, base64.b64encode(Path(shot).read_bytes()).decode())
+        return {"answer": answer}
+    return [question, MCPImage(path=shot)]
 
 
 # --- Gmail flow (ported from job/harness_*.py) ---
